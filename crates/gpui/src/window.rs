@@ -3803,7 +3803,11 @@ impl Window {
         if fade.right {
             ramp = ramp.min(((fade.bounds.right().0 - center.x.0) / band).clamp(0.0, 1.0));
         }
-        opacity * ramp
+        // Quadratic ease-in: a linear ramp reads weak over a wide band —
+        // content sliding under glass chrome stayed half-visible for most of
+        // the traverse. Squaring drops it fast near the fade edge while
+        // keeping the far end fully opaque.
+        opacity * ramp * ramp
     }
 
     /// The element opacity for a primitive covering `bounds`: the scoped
@@ -3836,7 +3840,8 @@ impl Window {
         if fade.right {
             ramp = ramp.min(((fade.bounds.right().0 - bounds.right().0) / band).clamp(0.0, 1.0));
         }
-        opacity * ramp
+        // Quadratic ease-in — see element_opacity_at.
+        opacity * ramp * ramp
     }
 
     /// Per-pixel [`EdgeFade`] for quads: a SOLID background on a quad that
@@ -3901,16 +3906,25 @@ impl Window {
             // A quad spanning BOTH bands can't be expressed with two stops;
             // no variation at all needs no gradient.
             (true, true) | (false, false) => return None,
+            // Endpoint alphas squared to track the quadratic per-primitive
+            // ramp; the shader still interpolates linearly BETWEEN the two
+            // stops, a close-enough mid-band approximation for washes.
             (true, false) => {
                 let v0 = lo.max(edge_lo);
                 let v1 = hi.min(edge_lo + band_lo);
-                let ramp = |v: f32| ((v - edge_lo) / band_lo).clamp(0.0, 1.0);
+                let ramp = |v: f32| {
+                    let t = ((v - edge_lo) / band_lo).clamp(0.0, 1.0);
+                    t * t
+                };
                 (v0, v1, ramp(v0), ramp(v1))
             }
             (false, true) => {
                 let v0 = lo.max(edge_hi - band_hi);
                 let v1 = hi.min(edge_hi);
-                let ramp = |v: f32| ((edge_hi - v) / band_hi).clamp(0.0, 1.0);
+                let ramp = |v: f32| {
+                    let t = ((edge_hi - v) / band_hi).clamp(0.0, 1.0);
+                    t * t
+                };
                 (v0, v1, ramp(v0), ramp(v1))
             }
         };
