@@ -827,6 +827,12 @@ pub struct EdgeFade {
     pub bounds: Bounds<Pixels>,
     /// Ramp height inside each active edge.
     pub band: Pixels,
+    /// Per-edge override of [`Self::band`] for the top edge (`None` = `band`).
+    /// Asymmetric ramps let content fade across chrome of different heights —
+    /// e.g. a short titlebar above, a tall composer below.
+    pub band_top: Option<Pixels>,
+    /// Per-edge override of [`Self::band`] for the bottom edge.
+    pub band_bottom: Option<Pixels>,
     /// Fade primitives approaching the region's top edge.
     pub top: bool,
     /// Fade primitives approaching the region's bottom edge.
@@ -835,6 +841,16 @@ pub struct EdgeFade {
     pub left: bool,
     /// Fade primitives approaching the region's right edge.
     pub right: bool,
+}
+
+impl EdgeFade {
+    fn top_band(&self) -> f32 {
+        self.band_top.unwrap_or(self.band).0.max(1.0)
+    }
+
+    fn bottom_band(&self) -> f32 {
+        self.band_bottom.unwrap_or(self.band).0.max(1.0)
+    }
 }
 
 /// A rectangular region that potentially blocks hitboxes inserted prior.
@@ -3774,10 +3790,12 @@ impl Window {
         let band = fade.band.0.max(1.0);
         let mut ramp: f32 = 1.0;
         if fade.top {
-            ramp = ramp.min(((center.y.0 - fade.bounds.top().0) / band).clamp(0.0, 1.0));
+            ramp = ramp
+                .min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
         }
         if fade.bottom {
-            ramp = ramp.min(((fade.bounds.bottom().0 - center.y.0) / band).clamp(0.0, 1.0));
+            ramp = ramp
+                .min(((fade.bounds.bottom().0 - center.y.0) / fade.bottom_band()).clamp(0.0, 1.0));
         }
         if fade.left {
             ramp = ramp.min(((center.x.0 - fade.bounds.left().0) / band).clamp(0.0, 1.0));
@@ -3803,11 +3821,14 @@ impl Window {
         let band = fade.band.0.max(1.0);
         let mut ramp: f32 = 1.0;
         if fade.top {
-            ramp = ramp.min(((bounds.top().0 - fade.bounds.top().0) / band).clamp(0.0, 1.0));
+            ramp = ramp
+                .min(((bounds.top().0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
         }
         if fade.bottom {
-            ramp = ramp
-                .min(((fade.bounds.bottom().0 - bounds.bottom().0) / band).clamp(0.0, 1.0));
+            ramp = ramp.min(
+                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band())
+                    .clamp(0.0, 1.0),
+            );
         }
         if fade.left {
             ramp = ramp.min(((bounds.left().0 - fade.bounds.left().0) / band).clamp(0.0, 1.0));
@@ -3841,7 +3862,7 @@ impl Window {
             return None;
         }
         let band = fade.band.0.max(1.0);
-        let (lo, hi, edge_lo, edge_hi, fade_lo, fade_hi, angle) = if horizontal {
+        let (lo, hi, edge_lo, edge_hi, fade_lo, fade_hi, band_lo, band_hi, angle) = if horizontal {
             (
                 bounds.left().0,
                 bounds.right().0,
@@ -3849,6 +3870,8 @@ impl Window {
                 fade.bounds.right().0,
                 fade.left,
                 fade.right,
+                band,
+                band,
                 90.0,
             )
         } else {
@@ -3859,12 +3882,14 @@ impl Window {
                 fade.bounds.bottom().0,
                 fade.top,
                 fade.bottom,
+                fade.top_band(),
+                fade.bottom_band(),
                 180.0,
             )
         };
         let extent = (hi - lo).max(1.0);
-        let in_lo_band = fade_lo && lo < edge_lo + band;
-        let in_hi_band = fade_hi && hi > edge_hi - band;
+        let in_lo_band = fade_lo && lo < edge_lo + band_lo;
+        let in_hi_band = fade_hi && hi > edge_hi - band_hi;
         let base = self.element_opacity();
         let color = background.solid;
         // Anchor both stops INSIDE the band segment, clamped to the quad: the
@@ -3878,14 +3903,14 @@ impl Window {
             (true, true) | (false, false) => return None,
             (true, false) => {
                 let v0 = lo.max(edge_lo);
-                let v1 = hi.min(edge_lo + band);
-                let ramp = |v: f32| ((v - edge_lo) / band).clamp(0.0, 1.0);
+                let v1 = hi.min(edge_lo + band_lo);
+                let ramp = |v: f32| ((v - edge_lo) / band_lo).clamp(0.0, 1.0);
                 (v0, v1, ramp(v0), ramp(v1))
             }
             (false, true) => {
-                let v0 = lo.max(edge_hi - band);
+                let v0 = lo.max(edge_hi - band_hi);
                 let v1 = hi.min(edge_hi);
-                let ramp = |v: f32| ((edge_hi - v) / band).clamp(0.0, 1.0);
+                let ramp = |v: f32| ((edge_hi - v) / band_hi).clamp(0.0, 1.0);
                 (v0, v1, ramp(v0), ramp(v1))
             }
         };
