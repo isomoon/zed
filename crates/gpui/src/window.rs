@@ -3906,25 +3906,28 @@ impl Window {
             // A quad spanning BOTH bands can't be expressed with two stops;
             // no variation at all needs no gradient.
             (true, true) | (false, false) => return None,
-            // Endpoint alphas squared to track the quadratic per-primitive
-            // ramp; the shader still interpolates linearly BETWEEN the two
-            // stops, a close-enough mid-band approximation for washes.
+            // Quads get a DELAYED KNEE rather than the glyphs' t² curve: two
+            // stops can't bend, but the shader clamps t outside the stop
+            // range — anchoring the zero stop 40% INTO the band renders a
+            // hard transparent plateau at the edge, then a linear rise. This
+            // keeps solid fills (bubbles, code blocks) at or below the
+            // glyphs' quadratic alpha everywhere, so dark washes never
+            // outlive their text as half-faded smears over a bright glass
+            // backdrop.
             (true, false) => {
-                let v0 = lo.max(edge_lo);
+                let knee = edge_lo + band_lo * 0.4;
+                let v0 = lo.max(knee);
                 let v1 = hi.min(edge_lo + band_lo);
-                let ramp = |v: f32| {
-                    let t = ((v - edge_lo) / band_lo).clamp(0.0, 1.0);
-                    t * t
-                };
+                let ramp =
+                    |v: f32| ((v - knee) / (band_lo * 0.6)).clamp(0.0, 1.0);
                 (v0, v1, ramp(v0), ramp(v1))
             }
             (false, true) => {
+                let knee = edge_hi - band_hi * 0.4;
                 let v0 = lo.max(edge_hi - band_hi);
-                let v1 = hi.min(edge_hi);
-                let ramp = |v: f32| {
-                    let t = ((edge_hi - v) / band_hi).clamp(0.0, 1.0);
-                    t * t
-                };
+                let v1 = hi.min(knee);
+                let ramp =
+                    |v: f32| ((knee - v) / (band_hi * 0.6)).clamp(0.0, 1.0);
                 (v0, v1, ramp(v0), ramp(v1))
             }
         };
