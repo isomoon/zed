@@ -104,6 +104,11 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+  // Per-pixel scoped edge fade — applied to the fill HERE so every return
+  // path (including the borderless fast paths) inherits it; the border
+  // fades at its own use below.
+  float edge_fade = edge_fade_alpha(input.position.y, quad.fade);
+  background_color.a *= edge_fade;
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
     quad.corner_radii.bottom_left == 0.0 &&
@@ -212,6 +217,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   float4 color = background_color;
   if (border_sdf < antialias_threshold) {
     float4 border_color = input.border_color;
+    border_color.a *= edge_fade;
 
     // Dashed border logic when border_style == 1
     if (quad.border_style == 1) {
@@ -394,7 +400,6 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                 saturate(antialias_threshold - inner_sdf));
   }
 
-  color.a *= edge_fade_alpha(input.position.y, quad.fade);
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
 

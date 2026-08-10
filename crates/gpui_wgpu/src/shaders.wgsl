@@ -592,8 +592,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     let quad = load_quad(input.quad_id);
 
-    let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+    var background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
+    // Per-pixel scoped edge fade — applied to the fill HERE so every return
+    // path (including the fast paths) inherits it.
+    let edge_fade = edge_fade_alpha(input.position.y, quad.fade);
+    background_color.a *= edge_fade;
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.bottom_left == 0.0 &&
@@ -606,7 +610,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, edge_fade_alpha(input.position.y, quad.fade));
+        return blend_color(background_color, 1.0);
     }
 
     let size = quad.bounds.size;
