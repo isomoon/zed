@@ -3844,103 +3844,33 @@ impl Window {
         opacity * ramp * ramp
     }
 
-    /// Per-pixel [`EdgeFade`] for quads: a SOLID background on a quad that
-    /// crosses an active fade ramp is rewritten as a linear gradient whose
-    /// stops sit AT the band boundary in quad space (the shader clamps `t`
-    /// outside the stop range), so the piecewise ramp renders exactly and the
-    /// GPU interpolates per pixel — uniform per-primitive alpha visibly
-    /// popped/clipped on anything wider than the band (tab washes, row
-    /// selections). `None` = no rewrite applies; callers fall back to the
-    /// center-point alpha.
-    fn quad_fade_gradient(
-        &self,
-        bounds: Bounds<Pixels>,
-        background: &Background,
-    ) -> Option<Background> {
-        let fade = self.edge_fade.as_ref()?;
-        if background.tag != crate::color::BackgroundTag::Solid {
-            return None;
-        }
-        let horizontal = fade.left || fade.right;
-        let vertical = fade.top || fade.bottom;
-        if horizontal == vertical {
-            return None;
-        }
-        let band = fade.band.0.max(1.0);
-        let (lo, hi, edge_lo, edge_hi, fade_lo, fade_hi, band_lo, band_hi, angle) = if horizontal {
-            (
-                bounds.left().0,
-                bounds.right().0,
-                fade.bounds.left().0,
-                fade.bounds.right().0,
-                fade.left,
-                fade.right,
-                band,
-                band,
-                90.0,
-            )
-        } else {
-            (
-                bounds.top().0,
-                bounds.bottom().0,
-                fade.bounds.top().0,
-                fade.bounds.bottom().0,
-                fade.top,
-                fade.bottom,
-                fade.top_band(),
-                fade.bottom_band(),
-                180.0,
-            )
+    /// The active [`EdgeFade`] scope as device-pixel shader params
+    /// ([`crate::EdgeFadeParams`]) — zeroed when no scope (or no vertical
+    /// edge) is active. Quads and polychrome sprites carry these into the
+    /// fragment shader for a TRUE per-pixel fade; horizontal edges are
+    /// unused by any caller and stay CPU-side.
+    fn scaled_edge_fade(&self) -> crate::EdgeFadeParams {
+        let Some(fade) = &self.edge_fade else {
+            return Default::default();
         };
-        let extent = (hi - lo).max(1.0);
-        let in_lo_band = fade_lo && lo < edge_lo + band_lo;
-        let in_hi_band = fade_hi && hi > edge_hi - band_hi;
-        let base = self.element_opacity();
-        let color = background.solid;
-        // Anchor both stops INSIDE the band segment, clamped to the quad: the
-        // ramp's zero must sit at the REGION edge (v = edge), not the quad
-        // edge — anchoring at a partially-scrolled-out quad's own edge left
-        // its visible part nonzero at the clip line (user report). The shader
-        // clamps t outside the stop range, extending both plateaus exactly.
-        let (v0, v1, a0, a1) = match (in_lo_band, in_hi_band) {
-            // A quad spanning BOTH bands can't be expressed with two stops;
-            // no variation at all needs no gradient.
-            (true, true) | (false, false) => return None,
-            // Quads get a DELAYED KNEE rather than the glyphs' t² curve: two
-            // stops can't bend, but the shader clamps t outside the stop
-            // range — anchoring the zero stop 40% INTO the band renders a
-            // hard transparent plateau at the edge, then a linear rise. This
-            // keeps solid fills (bubbles, code blocks) at or below the
-            // glyphs' quadratic alpha everywhere, so dark washes never
-            // outlive their text as half-faded smears over a bright glass
-            // backdrop.
-            (true, false) => {
-                let knee = edge_lo + band_lo * 0.4;
-                let v0 = lo.max(knee);
-                let v1 = hi.min(edge_lo + band_lo);
-                let ramp =
-                    |v: f32| ((v - knee) / (band_lo * 0.6)).clamp(0.0, 1.0);
-                (v0, v1, ramp(v0), ramp(v1))
-            }
-            (false, true) => {
-                let knee = edge_hi - band_hi * 0.4;
-                let v0 = lo.max(edge_hi - band_hi);
-                let v1 = hi.min(knee);
-                let ramp =
-                    |v: f32| ((knee - v) / (band_hi * 0.6)).clamp(0.0, 1.0);
-                (v0, v1, ramp(v0), ramp(v1))
-            }
-        };
-        let p0 = (v0 - lo) / extent;
-        let p1 = (v1 - lo) / extent;
-        if (p1 - p0) < 0.001 {
-            return None;
+        if !(fade.top || fade.bottom) {
+            return Default::default();
         }
-        Some(crate::linear_gradient(
-            angle,
-            crate::linear_color_stop(color.opacity(a0 * base), p0),
-            crate::linear_color_stop(color.opacity(a1 * base), p1),
-        ))
+        let scale = self.scale_factor();
+        crate::EdgeFadeParams {
+            top_y: fade.bounds.top().0 * scale,
+            bottom_y: fade.bounds.bottom().0 * scale,
+            band_top: if fade.top {
+                fade.top_band() * scale
+            } else {
+                0.0
+            },
+            band_bottom: if fade.bottom {
+                fade.bottom_band() * scale
+            } else {
+                0.0
+            },
+        }
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
@@ -4366,10 +4296,13 @@ impl Window {
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
 
-        let opacity = self.element_opacity_at(quad.bounds.center());
-        let background = self
-            .quad_fade_gradient(quad.bounds, &quad.background)
-            .unwrap_or_else(|| quad.background.opacity(opacity));
+        // Scoped edge fades apply PER PIXEL in the fragment shader
+        // ([`Quad::fade`]); only the uniform element opacity bakes into the
+        // colors here. (A CPU-side gradient rewrite used to approximate the
+        // fade for solid fills — per-primitive alpha for everything else —
+        // and large fills/images popped or smeared at the band.)
+        let opacity = self.element_opacity();
+        let background = quad.background.opacity(opacity);
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
@@ -4381,6 +4314,7 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            fade: self.scaled_edge_fade(),
         };
 
         if !quad.background.is_transparent() {
@@ -4670,10 +4604,7 @@ impl Window {
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.snapped_content_mask();
-            let opacity = self.element_opacity_for_bounds(&Bounds {
-                origin,
-                size: size(font_size * 0.6, font_size),
-            });
+            let opacity = self.element_opacity();
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
@@ -4682,6 +4613,7 @@ impl Window {
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
+                fade: self.scaled_edge_fade(),
                 tile,
                 opacity,
             });
@@ -4773,8 +4705,6 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let fade_bounds = bounds;
-
         let visible_bounds = bounds.intersect(&image_bounds);
         if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
             return Ok(());
@@ -4847,7 +4777,9 @@ impl Window {
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
             .scale(self.scale_factor());
-        let opacity = self.element_opacity_for_bounds(&fade_bounds);
+        // Per-pixel fade in the shader — bounds-conservative alpha blanked a
+        // whole image the moment its edge touched the band (user report).
+        let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
@@ -4856,6 +4788,7 @@ impl Window {
             bounds: visible_bounds_snapped,
             content_mask,
             corner_radii,
+            fade: self.scaled_edge_fade(),
             tile: sub_tile,
             opacity,
         });

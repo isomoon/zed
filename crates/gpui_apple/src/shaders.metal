@@ -34,6 +34,7 @@ float blur_along_x(float x, float y, float sigma, float corner,
                    float2 half_size);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
+float edge_fade_alpha(float y, EdgeFadeParams fade);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
   float4 solid_color, float4 color0, float4 color1);
 
@@ -393,6 +394,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                 saturate(antialias_threshold - inner_sdf));
   }
 
+  color.a *= edge_fade_alpha(input.position.y, quad.fade);
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
 
@@ -727,7 +729,8 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance);
+  color.a *= sprite.opacity * saturate(0.5 - distance) *
+             edge_fade_alpha(input.position.y, sprite.fade);
   return color;
 }
 
@@ -1175,6 +1178,21 @@ float2x2 rotate2d(float angle) {
     float s = sin(angle);
     float c = cos(angle);
     return float2x2(c, -s, s, c);
+}
+
+// Scoped edge fade, PER PIXEL (Quad::fade / PolychromeSprite::fade): a
+// squared ramp from 0 at the fade edge to 1 a band further in, matching the
+// CPU-side per-glyph curve. Zero band = edge disabled; a zeroed struct is a
+// no-op (returns 1).
+float edge_fade_alpha(float y, EdgeFadeParams fade) {
+  float ramp = 1.0;
+  if (fade.band_top > 0.0) {
+    ramp = min(ramp, clamp((y - fade.top_y) / fade.band_top, 0.0, 1.0));
+  }
+  if (fade.band_bottom > 0.0) {
+    ramp = min(ramp, clamp((fade.bottom_y - y) / fade.band_bottom, 0.0, 1.0));
+  }
+  return ramp * ramp;
 }
 
 float4 fill_color(Background background,

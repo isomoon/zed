@@ -552,6 +552,21 @@ impl PrimitiveBatch {
     }
 }
 
+/// Per-primitive scoped edge fade (see `Window::with_edge_fade`): the
+/// fragment shader multiplies alpha by a squared ramp measured from these
+/// window-space edges (device pixels) — a TRUE per-pixel fade, so large
+/// fills and images dissolve across the band instead of popping at their
+/// bounding-box edge. A zero band disables that edge; zeroed = no fade.
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct EdgeFadeParams {
+    pub top_y: f32,
+    pub bottom_y: f32,
+    pub band_top: f32,
+    pub band_bottom: f32,
+}
+
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -564,6 +579,7 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    pub fade: EdgeFadeParams,
 }
 
 impl From<Quad> for Primitive {
@@ -792,6 +808,7 @@ pub struct PolychromeSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    pub fade: EdgeFadeParams,
     pub tile: AtlasTile,
 }
 

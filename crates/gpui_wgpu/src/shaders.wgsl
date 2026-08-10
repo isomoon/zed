@@ -516,6 +516,27 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
 // --- quads --- //
 
+// Mirrors gpui's EdgeFadeParams (device pixels; zero band = edge disabled).
+struct EdgeFadeParams {
+    top_y: f32,
+    bottom_y: f32,
+    band_top: f32,
+    band_bottom: f32,
+}
+
+// Per-pixel scoped edge fade — squared ramp, matching the CPU per-glyph
+// curve. A zeroed struct is a no-op.
+fn edge_fade_alpha(y: f32, fade: EdgeFadeParams) -> f32 {
+    var ramp = 1.0;
+    if (fade.band_top > 0.0) {
+        ramp = min(ramp, clamp((y - fade.top_y) / fade.band_top, 0.0, 1.0));
+    }
+    if (fade.band_bottom > 0.0) {
+        ramp = min(ramp, clamp((fade.bottom_y - y) / fade.band_bottom, 0.0, 1.0));
+    }
+    return ramp * ramp;
+}
+
 struct Quad {
     order: u32,
     border_style: u32,
@@ -525,6 +546,7 @@ struct Quad {
     border_color: Hsla,
     corner_radii: Corners,
     border_widths: Edges,
+    fade: EdgeFadeParams,
 }
 
 struct QuadVarying {
@@ -584,7 +606,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, edge_fade_alpha(input.position.y, quad.fade));
     }
 
     let size = quad.bounds.size;
@@ -889,7 +911,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+    return blend_color(color, saturate(antialias_threshold - outer_sdf) * edge_fade_alpha(input.position.y, quad.fade));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -1267,6 +1289,7 @@ struct PolychromeSprite {
     bounds: Bounds,
     content_mask: Bounds,
     corner_radii: Corners,
+    fade: EdgeFadeParams,
     tile: AtlasTile,
 }
 
@@ -1307,7 +1330,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    return blend_color(color, sprite.opacity * saturate(0.5 - distance) * edge_fade_alpha(input.position.y, sprite.fade));
 }
 
 // --- surfaces --- //
