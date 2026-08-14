@@ -34,7 +34,7 @@ float blur_along_x(float x, float y, float sigma, float corner,
                    float2 half_size);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
-float edge_fade_alpha(float y, EdgeFadeParams fade);
+float edge_fade_alpha(float2 position, EdgeFadeParams fade);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
   float4 solid_color, float4 color0, float4 color1);
 
@@ -107,7 +107,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   // Per-pixel scoped edge fade — applied to the fill HERE so every return
   // path (including the borderless fast paths) inherits it; the border
   // fades at its own use below.
-  float edge_fade = edge_fade_alpha(input.position.y, quad.fade);
+  float edge_fade = edge_fade_alpha(input.position.xy, quad.fade);
   background_color.a *= edge_fade;
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
@@ -735,7 +735,7 @@ fragment float4 polychrome_sprite_fragment(
     color.b = grayscale;
   }
   color.a *= sprite.opacity * saturate(0.5 - distance) *
-             edge_fade_alpha(input.position.y, sprite.fade);
+             edge_fade_alpha(input.position.xy, sprite.fade);
   return color;
 }
 
@@ -1187,15 +1187,21 @@ float2x2 rotate2d(float angle) {
 
 // Scoped edge fade, PER PIXEL (Quad::fade / PolychromeSprite::fade): a
 // squared ramp from 0 at the fade edge to 1 a band further in, matching the
-// CPU-side per-glyph curve. Zero band = edge disabled; a zeroed struct is a
-// no-op (returns 1).
-float edge_fade_alpha(float y, EdgeFadeParams fade) {
+// CPU-side per-glyph curve — all four edges. Zero band = edge disabled; a
+// zeroed struct is a no-op (returns 1).
+float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
   float ramp = 1.0;
   if (fade.band_top > 0.0) {
-    ramp = min(ramp, clamp((y - fade.top_y) / fade.band_top, 0.0, 1.0));
+    ramp = min(ramp, clamp((position.y - fade.top_y) / fade.band_top, 0.0, 1.0));
   }
   if (fade.band_bottom > 0.0) {
-    ramp = min(ramp, clamp((fade.bottom_y - y) / fade.band_bottom, 0.0, 1.0));
+    ramp = min(ramp, clamp((fade.bottom_y - position.y) / fade.band_bottom, 0.0, 1.0));
+  }
+  if (fade.band_left > 0.0) {
+    ramp = min(ramp, clamp((position.x - fade.left_x) / fade.band_left, 0.0, 1.0));
+  }
+  if (fade.band_right > 0.0) {
+    ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
   }
   return ramp * ramp;
 }

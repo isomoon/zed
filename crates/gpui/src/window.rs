@@ -3845,18 +3845,19 @@ impl Window {
     }
 
     /// The active [`EdgeFade`] scope as device-pixel shader params
-    /// ([`crate::EdgeFadeParams`]) — zeroed when no scope (or no vertical
-    /// edge) is active. Quads and polychrome sprites carry these into the
-    /// fragment shader for a TRUE per-pixel fade; horizontal edges are
-    /// unused by any caller and stay CPU-side.
+    /// ([`crate::EdgeFadeParams`]) — zeroed when no scope (or no active
+    /// edge) exists. Quads and polychrome sprites carry these into the
+    /// fragment shader for a TRUE per-pixel fade, all four edges (glyphs
+    /// keep their CPU-side per-glyph curve).
     fn scaled_edge_fade(&self) -> crate::EdgeFadeParams {
         let Some(fade) = &self.edge_fade else {
             return Default::default();
         };
-        if !(fade.top || fade.bottom) {
+        if !(fade.top || fade.bottom || fade.left || fade.right) {
             return Default::default();
         }
         let scale = self.scale_factor();
+        let band = fade.band.0.max(1.0);
         crate::EdgeFadeParams {
             top_y: fade.bounds.top().0 * scale,
             bottom_y: fade.bounds.bottom().0 * scale,
@@ -3870,6 +3871,10 @@ impl Window {
             } else {
                 0.0
             },
+            left_x: fade.bounds.left().0 * scale,
+            right_x: fade.bounds.right().0 * scale,
+            band_left: if fade.left { band * scale } else { 0.0 },
+            band_right: if fade.right { band * scale } else { 0.0 },
         }
     }
 

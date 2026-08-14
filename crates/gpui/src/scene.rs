@@ -565,6 +565,10 @@ pub struct EdgeFadeParams {
     pub bottom_y: f32,
     pub band_top: f32,
     pub band_bottom: f32,
+    pub left_x: f32,
+    pub right_x: f32,
+    pub band_left: f32,
+    pub band_right: f32,
 }
 
 #[derive(Default, Debug, Copy, Clone)]
