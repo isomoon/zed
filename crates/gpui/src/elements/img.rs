@@ -347,7 +347,15 @@ impl Element for Img {
 
                             let image_size = data.render_size(frame_index);
 
-                            if style.aspect_ratio.is_none() {
+                            // Intrinsic aspect only when a dimension is AUTO
+                            // (the CSS aspect-ratio rule): stamping it over
+                            // explicit dims let a Cover-fitted thumbnail grow
+                            // past its frame, so the rectangular overflow
+                            // clip squared its bottom corners.
+                            if style.aspect_ratio.is_none()
+                                && (matches!(style.size.width, Length::Auto)
+                                    || matches!(style.size.height, Length::Auto))
+                            {
                                 style.aspect_ratio = Some(image_size.width / image_size.height);
                             }
 
