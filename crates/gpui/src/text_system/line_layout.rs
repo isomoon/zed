@@ -1055,6 +1055,29 @@ mod tests {
             .collect()
     }
 
+
+    #[test]
+    fn test_wrap_boundaries_keep_closing_punctuation_attached() {
+        // `aaa aaaa."` shaped at 8px cells, wrapped at 72px: the `"` is the
+        // overflow glyph. The old any-non-word-char rule put a boundary right
+        // before it, orphaning the quote on the next line; the break must
+        // fall back to the word boundary at glyph 4 instead.
+        let text = "aaa aaaa.\"";
+        let glyphs = (0..text.len())
+            .map(|i| glyph_at(i as f32 * 8., i))
+            .collect::<Vec<_>>();
+        let mut layout = make_layout(glyphs);
+        layout.width = px(80.);
+        let boundaries = layout.compute_wrap_boundaries(text, px(72.), None);
+        assert_eq!(
+            boundaries.as_slice(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 4
+            }]
+        );
+    }
+
     #[test]
     fn test_force_width_latin_unchanged() {
         let cell_width = px(8.);
