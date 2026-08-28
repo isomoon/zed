@@ -92,6 +92,19 @@ fn read_edges(cursor: ptr<function, InstanceCursor>) -> Edges {
     );
 }
 
+fn read_edge_fade(cursor: ptr<function, InstanceCursor>) -> EdgeFadeParams {
+    return EdgeFadeParams(
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+    );
+}
+
 fn read_color_stop(cursor: ptr<function, InstanceCursor>) -> LinearColorStop {
     return LinearColorStop(read_hsla(cursor), read_f32(cursor));
 }
@@ -146,6 +159,7 @@ fn load_quad(instance_id: u32) -> Quad {
         read_hsla(&cursor),
         read_corners(&cursor),
         read_edges(&cursor),
+        read_edge_fade(&cursor),
     );
 }
 
@@ -216,6 +230,7 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_corners(&cursor),
+        read_edge_fade(&cursor),
         read_atlas_tile(&cursor),
     );
 }

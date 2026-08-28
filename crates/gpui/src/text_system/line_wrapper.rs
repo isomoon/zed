@@ -714,23 +714,16 @@ mod tests {
             })
             .collect()
     }
-
-
     #[test]
     fn test_wrap_line_keeps_closing_punctuation_attached() {
         let mut wrapper = build_wrapper();
 
-        // `aaa aaaa."` at 72px (9 chars/line): the `"` is the overflow char.
-        // A break candidate directly before it (the old any-non-word-char
-        // rule) orphaned the quote at the start of the next line; the break
-        // must fall back to the space instead, keeping `aaaa."` together.
         assert_eq!(
             wrapper
                 .wrap_line(&[LineFragment::text("aaa aaaa.\"")], px(72.))
                 .collect::<Vec<_>>(),
             &[Boundary::new(4, 0)],
         );
-        // Same shape for other closing punctuation.
         assert_eq!(
             wrapper
                 .wrap_line(&[LineFragment::text("aaa aaaaa!")], px(72.))
@@ -743,8 +736,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[Boundary::new(4, 0)],
         );
-        // Non-word chars after a SPACE (opening punctuation) still wrap with
-        // the word they introduce: the final line is `"cc"`, quote attached.
         assert_eq!(
             wrapper
                 .wrap_line(&[LineFragment::text("aaaa bbb \"cc\"")], px(72.))
@@ -757,10 +748,6 @@ mod tests {
     fn test_wrap_line_breaks_at_path_separators() {
         let mut wrapper = build_wrapper();
 
-        // `/` stays a break opportunity so long paths and URLs wrap at their
-        // separators instead of mid-segment. Guarding the non-word-char break
-        // rule on the PREVIOUS char (an earlier attempt at keeping closing
-        // punctuation attached) silently moved these to 7/14/21.
         assert_eq!(
             wrapper
                 .wrap_line(&[LineFragment::text("aaa/bbbbbb/cccccc/dddddd")], px(72.))

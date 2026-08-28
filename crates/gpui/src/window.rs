@@ -6,8 +6,8 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
@@ -16,7 +16,7 @@ use crate::{
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, BackdropBlur, ScaledPixels, Scene, Shadow, SharedString, Size,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
@@ -815,23 +815,16 @@ impl HitboxId {
     }
 }
 
-/// A scoped vertical edge fade (see [`Window::with_edge_fade`]): primitives
-/// painted inside the scope get their opacity multiplied by a ramp that runs
-/// from 0 at an active edge of `bounds` to 1 a `band` further in. Built for
-/// scroll-edge fades over translucent/blurred window backgrounds, where a
-/// backdrop-colored gradient overlay cannot exist (there is no paintable
-/// color equal to "what is behind the window").
+/// A scoped fade for primitives approaching selected edges of a region.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EdgeFade {
     /// The faded region, in window coordinates.
     pub bounds: Bounds<Pixels>,
-    /// Ramp height inside each active edge.
+    /// Ramp width inside each active edge.
     pub band: Pixels,
-    /// Per-edge override of [`Self::band`] for the top edge (`None` = `band`).
-    /// Asymmetric ramps let content fade across chrome of different heights —
-    /// e.g. a short titlebar above, a tall composer below.
+    /// Overrides [`Self::band`] for the top edge.
     pub band_top: Option<Pixels>,
-    /// Per-edge override of [`Self::band`] for the bottom edge.
+    /// Overrides [`Self::band`] for the bottom edge.
     pub band_bottom: Option<Pixels>,
     /// Fade primitives approaching the region's top edge.
     pub top: bool,
@@ -3656,12 +3649,7 @@ impl Window {
         result
     }
 
-    /// Executes the provided function with a vertical [`EdgeFade`] applied:
-    /// every primitive painted inside is additionally faded by its vertical
-    /// position — full alpha in the region's body, ramping to zero across
-    /// `fade.band` at each active edge. Granularity is per-primitive (each
-    /// quad/glyph/sprite takes the ramp value at its own position), which
-    /// reads as a smooth gradient for text and small marks.
+    /// Executes the provided function with an optional [`EdgeFade`].
     pub fn with_edge_fade<R>(
         &mut self,
         fade: Option<EdgeFade>,
@@ -3779,8 +3767,7 @@ impl Window {
         self.element_opacity
     }
 
-    /// The element opacity at a position (window coords): the scoped uniform
-    /// opacity times the [`EdgeFade`] ramp evaluated at `center`.
+    /// Returns the element opacity after applying the edge fade at `center`.
     #[inline]
     pub(crate) fn element_opacity_at(&self, center: Point<Pixels>) -> f32 {
         let opacity = self.element_opacity();
@@ -3790,8 +3777,7 @@ impl Window {
         let band = fade.band.0.max(1.0);
         let mut ramp: f32 = 1.0;
         if fade.top {
-            ramp = ramp
-                .min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
+            ramp = ramp.min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
         }
         if fade.bottom {
             ramp = ramp
@@ -3803,19 +3789,10 @@ impl Window {
         if fade.right {
             ramp = ramp.min(((fade.bounds.right().0 - center.x.0) / band).clamp(0.0, 1.0));
         }
-        // Quadratic ease-in: a linear ramp reads weak over a wide band —
-        // content sliding under glass chrome stayed half-visible for most of
-        // the traverse. Squaring drops it fast near the fade edge while
-        // keeping the far end fully opaque.
         opacity * ramp * ramp
     }
 
-    /// The element opacity for a primitive covering `bounds`: the scoped
-    /// uniform opacity times the [`EdgeFade`] ramp at the bounds' NEAREST
-    /// point to each active edge. Conservative on purpose — a sprite reaches
-    /// zero exactly as its leading edge touches the region boundary, so the
-    /// clip can never slice a visible glyph (center sampling left dim-but-
-    /// sliced glyphs at the edge).
+    /// Returns the opacity at the point in `bounds` nearest each faded edge.
     #[inline]
     pub(crate) fn element_opacity_for_bounds(&self, bounds: &Bounds<Pixels>) -> f32 {
         let opacity = self.element_opacity();
@@ -3830,8 +3807,7 @@ impl Window {
         }
         if fade.bottom {
             ramp = ramp.min(
-                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band())
-                    .clamp(0.0, 1.0),
+                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band()).clamp(0.0, 1.0),
             );
         }
         if fade.left {
@@ -3840,15 +3816,10 @@ impl Window {
         if fade.right {
             ramp = ramp.min(((fade.bounds.right().0 - bounds.right().0) / band).clamp(0.0, 1.0));
         }
-        // Quadratic ease-in — see element_opacity_at.
         opacity * ramp * ramp
     }
 
-    /// The active [`EdgeFade`] scope as device-pixel shader params
-    /// ([`crate::EdgeFadeParams`]) — zeroed when no scope (or no active
-    /// edge) exists. Quads and polychrome sprites carry these into the
-    /// fragment shader for a TRUE per-pixel fade, all four edges (glyphs
-    /// keep their CPU-side per-glyph curve).
+    /// Returns device-pixel parameters for the active edge fade.
     fn scaled_edge_fade(&self) -> crate::EdgeFadeParams {
         let Some(fade) = &self.edge_fade else {
             return Default::default();
@@ -4251,12 +4222,9 @@ impl Window {
         }
     }
 
-    /// Paint a within-window backdrop blur: everything already painted
-    /// beneath `bounds` is snapshotted and painted back gaussian-blurred
-    /// inside the rounded rect (frosted-glass popovers). macOS Metal only —
-    /// other renderers ignore it, so callers keep a translucent fill over it
-    /// and the fallback is merely unblurred. Content painted AFTER this call
-    /// composites on top of the blur.
+    /// Paints a backdrop blur over content already recorded in the scene.
+    ///
+    /// Renderers without backdrop blur support ignore this primitive.
     pub fn paint_backdrop_blur(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -4266,20 +4234,6 @@ impl Window {
         self.invalidator.debug_assert_paint();
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask().scale(scale_factor);
-        // Invisible splitter primitive: forces a batch boundary at this order
-        // so the renderer can break its render pass exactly here.
-        self.next_frame.scene.insert_primitive(Shadow {
-            order: 0,
-            blur_radius: ScaledPixels(0.),
-            bounds: bounds.scale(scale_factor),
-            corner_radii: corner_radii.scale(scale_factor),
-            content_mask,
-            color: crate::transparent_black(),
-            element_bounds: bounds.scale(scale_factor),
-            element_corner_radii: corner_radii.scale(scale_factor),
-            inset: 0,
-            pad: 0,
-        });
         self.next_frame.scene.insert_backdrop_blur(BackdropBlur {
             order: 0,
             blur_radius: blur_radius.scale(scale_factor),
@@ -4301,11 +4255,6 @@ impl Window {
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
 
-        // Scoped edge fades apply PER PIXEL in the fragment shader
-        // ([`Quad::fade`]); only the uniform element opacity bakes into the
-        // colors here. (A CPU-side gradient rewrite used to approximate the
-        // fade for solid fills — per-primitive alpha for everything else —
-        // and large fills/images popped or smeared at the band.)
         let opacity = self.element_opacity();
         let background = quad.background.opacity(opacity);
         let snapped_bounds = self.snap_bounds(quad.bounds);
@@ -4782,8 +4731,6 @@ impl Window {
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
             .scale(self.scale_factor());
-        // Per-pixel fade in the shader — bounds-conservative alpha blanked a
-        // whole image the moment its edge touched the band (user report).
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {

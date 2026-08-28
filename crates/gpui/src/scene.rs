@@ -41,7 +41,7 @@ impl From<bool> for PaddedBool32 {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    layer_stack: Vec<PaintLayer>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -50,10 +50,13 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
-    /// Backdrop-blur regions — deliberately OUTSIDE the primitive batch
-    /// stream: the renderer breaks its render pass at each blur's order to
-    /// snapshot the framebuffer (macOS Metal; other renderers ignore them).
+    /// Backdrop blur regions in draw order.
     pub backdrop_blurs: Vec<BackdropBlur>,
+}
+
+struct PaintLayer {
+    bounds: Bounds<ScaledPixels>,
+    order: DrawOrder,
 }
 
 #[expect(missing_docs)]
@@ -79,7 +82,7 @@ impl Scene {
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        self.layer_stack.push(PaintLayer { bounds, order });
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
@@ -94,14 +97,16 @@ impl Scene {
         if clipped_bounds.is_empty() {
             return;
         }
-        blur.order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        blur.order = self.primitive_bounds.insert(clipped_bounds);
         self.backdrop_blurs.push(blur);
         self.paint_operations
             .push(PaintOperation::BackdropBlur(blur));
+
+        if let Some(layer) = self.layer_stack.last_mut() {
+            // A backdrop blur depends on exact paint order, so later layer
+            // primitives need a new order above it.
+            layer.order = self.primitive_bounds.insert(layer.bounds);
+        }
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -117,7 +122,7 @@ impl Scene {
         let order = self
             .layer_stack
             .last()
-            .copied()
+            .map(|layer| layer.order)
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
@@ -209,6 +214,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrop_blurs_start: 0,
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
         }
     }
 }
@@ -231,6 +238,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    BackdropBlur,
 }
 
 pub(crate) enum PaintOperation {
@@ -306,6 +314,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrop_blurs_start: usize,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -338,6 +348,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.backdrop_blurs_iter.peek().map(|blur| blur.order),
+                PrimitiveKind::BackdropBlur,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -484,6 +498,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::BackdropBlur => {
+                let backdrop_blurs_start = self.backdrop_blurs_start;
+                let mut backdrop_blurs_end = backdrop_blurs_start + 1;
+                self.backdrop_blurs_iter.next();
+                while self
+                    .backdrop_blurs_iter
+                    .next_if(|blur| (blur.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    backdrop_blurs_end += 1;
+                }
+                self.backdrop_blurs_start = backdrop_blurs_end;
+                Some(PrimitiveBatch::BackdropBlurs(
+                    backdrop_blurs_start..backdrop_blurs_end,
+                ))
+            }
         }
     }
 }
@@ -516,6 +546,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    BackdropBlurs(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -548,15 +579,12 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
         }
     }
 }
 
-/// Per-primitive scoped edge fade (see `Window::with_edge_fade`): the
-/// fragment shader multiplies alpha by a squared ramp measured from these
-/// window-space edges (device pixels) — a TRUE per-pixel fade, so large
-/// fills and images dissolve across the band instead of popping at their
-/// bounding-box edge. A zero band disables that edge; zeroed = no fade.
+/// Device-pixel parameters for a scoped edge fade.
 #[derive(Default, Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -611,10 +639,7 @@ impl From<Underline> for Primitive {
     }
 }
 
-/// A within-window backdrop blur region: the renderer snapshots everything
-/// painted below this order and paints it back gaussian-blurred inside the
-/// rounded bounds (frosted-glass popovers). macOS Metal only — see
-/// [`crate::Window::paint_backdrop_blur`].
+/// A region that blurs content painted earlier in the scene.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -1004,5 +1029,85 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_bounds() -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: Size {
+                width: ScaledPixels(100.0),
+                height: ScaledPixels(100.0),
+            },
+        }
+    }
+
+    fn test_quad() -> Quad {
+        let bounds = test_bounds();
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        }
+    }
+
+    fn test_backdrop_blur() -> BackdropBlur {
+        let bounds = test_bounds();
+        BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(8.0),
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
+        }
+    }
+
+    #[test]
+    fn backdrop_blur_is_a_trailing_batch() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(test_quad());
+        scene.insert_backdrop_blur(test_backdrop_blur());
+        scene.finish();
+
+        let mut batches = scene.batches();
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::Quads(range)) if range == (0..1)
+        ));
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::BackdropBlurs(range)) if range == (0..1)
+        ));
+        assert!(batches.next().is_none());
+    }
+
+    #[test]
+    fn backdrop_blur_splits_layer_batches() {
+        let mut scene = Scene::default();
+        scene.push_layer(test_bounds());
+        scene.insert_primitive(test_quad());
+        scene.insert_backdrop_blur(test_backdrop_blur());
+        scene.insert_primitive(test_quad());
+        scene.pop_layer();
+        scene.finish();
+
+        let mut batches = scene.batches();
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::Quads(range)) if range == (0..1)
+        ));
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::BackdropBlurs(range)) if range == (0..1)
+        ));
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::Quads(range)) if range == (1..2)
+        ));
+        assert!(batches.next().is_none());
     }
 }

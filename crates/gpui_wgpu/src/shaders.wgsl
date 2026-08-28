@@ -516,7 +516,6 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
 // --- quads --- //
 
-// Mirrors gpui's EdgeFadeParams (device pixels; zero band = edge disabled).
 struct EdgeFadeParams {
     top_y: f32,
     bottom_y: f32,
@@ -528,8 +527,6 @@ struct EdgeFadeParams {
     band_right: f32,
 }
 
-// Per-pixel scoped edge fade — squared ramp, matching the CPU per-glyph
-// curve, all four edges. A zeroed struct is a no-op.
 fn edge_fade_alpha(position: vec2<f32>, fade: EdgeFadeParams) -> f32 {
     var ramp = 1.0;
     if (fade.band_top > 0.0) {
@@ -604,8 +601,6 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     var background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
-    // Per-pixel scoped edge fade — applied to the fill HERE so every return
-    // path (including the fast paths) inherits it.
     let edge_fade = edge_fade_alpha(input.position.xy, quad.fade);
     background_color.a *= edge_fade;
 
@@ -723,6 +718,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     var color = background_color;
     if (border_sdf < antialias_threshold) {
         var border_color = input.border_color;
+        border_color.a *= edge_fade;
 
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {
@@ -925,7 +921,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf) * edge_fade_alpha(input.position.xy, quad.fade));
+    return blend_color(color, saturate(antialias_threshold - outer_sdf));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -1398,19 +1394,6 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
     return ycbcr_to_RGB * y_cb_cr;
 }
 
-// ---------------------------------------------------------------------------
-// Backdrop blur (Linux/wgpu port of the macOS Metal frosted-glass path).
-//
-// The renderer breaks its render pass at each blur's draw order, copies the
-// padded region out of the surface into a scratch texture, runs the two
-// separable passes below at a downsampled scale, and composites the result
-// back over the blur's rounded bounds before the pass continues.
-// ---------------------------------------------------------------------------
-
-/// Uniform for the two separable blur passes (group 1). `sigma` and `stride`
-/// are expressed in SOURCE texels: the horizontal pass reads the full-res
-/// snapshot with stride = downsample factor (blurring the downsampled image),
-/// the vertical pass reads the half-product with stride 1.
 struct BlurPassParams {
     direction: vec2<f32>,
     sigma: f32,
@@ -1429,7 +1412,6 @@ struct BlurPassVarying {
 
 @vertex
 fn vs_blur_pass(@builtin(vertex_index) vertex_id: u32) -> BlurPassVarying {
-    // Fullscreen triangle-strip quad over the (downsampled) target.
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     var out = BlurPassVarying();
     out.position = vec4<f32>(unit_vertex * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
@@ -1439,28 +1421,27 @@ fn vs_blur_pass(@builtin(vertex_index) vertex_id: u32) -> BlurPassVarying {
 
 @fragment
 fn fs_blur_pass(input: BlurPassVarying) -> @location(0) vec4<f32> {
-    let params = b_blur_pass;
-    let sigma = max(params.sigma, 0.5);
-    // The gaussian only reaches ~3σ beyond a sampled pixel.
+    let parameters = b_blur_pass;
+    let sigma = max(parameters.sigma, 0.5);
     let radius = i32(ceil(sigma * 3.0));
-    let step = params.direction * params.stride * params.source_texel_size;
+    let sample_step = parameters.direction * parameters.stride * parameters.source_texel_size;
 
     var sum = vec4<f32>(0.0);
     var total_weight = 0.0;
-    // The snapshot is sampled with clamp-to-edge, matching the Metal path
-    // (the copy window fills the whole texture with real content, so edges
-    // only clamp where the region itself clamps against the drawable).
-    let base = input.uv;
-    for (var k = -radius; k <= radius; k++) {
-        let weight = exp(-f32(k) * f32(k) / (2.0 * sigma * sigma));
-        sum += textureSampleLevel(t_blur_source, s_blur_source, base + f32(k) * step, 0.0) * weight;
+    let base_texture_position = input.uv;
+    for (var sample_offset = -radius; sample_offset <= radius; sample_offset++) {
+        let weight = exp(-f32(sample_offset) * f32(sample_offset) / (2.0 * sigma * sigma));
+        sum += textureSampleLevel(
+            t_blur_source,
+            s_blur_source,
+            base_texture_position + f32(sample_offset) * sample_step,
+            0.0,
+        ) * weight;
         total_weight += weight;
     }
     return sum / total_weight;
 }
 
-/// Uniform for the composite pass (group 1): where the blurred snapshot is
-/// painted back and which sub-window of the drawable it holds.
 struct BackdropBlurParams {
     bounds: Bounds,
     corner_radii: Corners,
@@ -1481,31 +1462,35 @@ struct BackdropBlurVarying {
 @vertex
 fn vs_backdrop_blur(@builtin(vertex_index) vertex_id: u32) -> BackdropBlurVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let params = b_backdrop_blur;
+    let parameters = b_backdrop_blur;
 
     var out = BackdropBlurVarying();
-    out.position = to_device_position(unit_vertex, params.bounds);
-    out.device_position = unit_vertex * vec2<f32>(params.bounds.size) + params.bounds.origin;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, params.bounds, params.clip_bounds);
+    out.position = to_device_position(unit_vertex, parameters.bounds);
+    out.device_position =
+        unit_vertex * vec2<f32>(parameters.bounds.size) + parameters.bounds.origin;
+    out.clip_distances =
+        distance_from_clip_rect(unit_vertex, parameters.bounds, parameters.clip_bounds);
     return out;
 }
 
 @fragment
 fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
-    // Blending is disabled on this pipeline — the blur REPLACES the region —
-    // so fragments outside the rounded bounds (or the content mask) must
-    // discard, never return 0.
+    // Blending is disabled, so clipped fragments must not write transparent
+    // pixels.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         discard;
     }
-    let params = b_backdrop_blur;
-    if (quad_sdf(input.device_position, params.bounds, params.corner_radii) > 0.0) {
+    let parameters = b_backdrop_blur;
+    if (quad_sdf(input.device_position, parameters.bounds, parameters.corner_radii) > 0.0) {
         discard;
     }
 
-    // The blurred texture covers only `source_rect` (x, y, w, h) of the
-    // drawable, downsampled by a constant factor — normalized UVs map over
-    // it regardless of that factor.
-    let uv = (input.device_position - params.source_rect.xy) / params.source_rect.zw;
-    return textureSampleLevel(t_backdrop_blurred, s_backdrop_blurred, uv, 0.0);
+    let texture_position =
+        (input.device_position - parameters.source_rect.xy) / parameters.source_rect.zw;
+    return textureSampleLevel(
+        t_backdrop_blurred,
+        s_backdrop_blurred,
+        texture_position,
+        0.0,
+    );
 }

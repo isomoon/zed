@@ -347,11 +347,6 @@ impl Element for Img {
 
                             let image_size = data.render_size(frame_index);
 
-                            // Intrinsic aspect only when a dimension is AUTO
-                            // (the CSS aspect-ratio rule): stamping it over
-                            // explicit dims let a Cover-fitted thumbnail grow
-                            // past its frame, so the rectangular overflow
-                            // clip squared its bottom corners.
                             if style.aspect_ratio.is_none()
                                 && (matches!(style.size.width, Length::Auto)
                                     || matches!(style.size.height, Length::Auto))
@@ -603,13 +598,10 @@ impl ImageSource {
         }
     }
 
-    /// Remove this image source from the asset system AND free the decoded
-    /// image's sprite-atlas tiles in every window. [`Self::remove_asset`]
-    /// alone leaks the tiles for `Image`/`Resource` sources: the decoded
-    /// `Arc<RenderImage>` lives inside the asset cache, so callers can't
-    /// reach [`App::drop_image`] themselves. Pass the window currently being
-    /// updated, if any — it is absent from `App::windows` during its own
-    /// update and would otherwise keep its tiles.
+    /// Removes this source from the asset cache and frees its sprite-atlas entries.
+    ///
+    /// Pass the window currently being updated because it is temporarily absent
+    /// from the app's window collection.
     pub fn evict(&self, window: Option<&mut Window>, cx: &mut App) {
         let render_image = match self {
             ImageSource::Resource(resource) => cx

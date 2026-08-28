@@ -2649,9 +2649,7 @@ impl App {
         self.loading_assets.contains_key(&asset_id)
     }
 
-    /// Returns the output of an asset load that has already completed,
-    /// without starting a load. `None` if the asset isn't cached or is still
-    /// loading.
+    /// Returns a completed cached asset without starting a load.
     pub fn peek_asset<A: Asset>(&self, source: &A::Source) -> Option<A::Output> {
         let asset_id = (TypeId::of::<A>(), hash(source));
         self.loading_assets

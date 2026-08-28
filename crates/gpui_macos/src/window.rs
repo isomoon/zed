@@ -3431,14 +3431,8 @@ extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect)
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
         // Use a colorless semantic material. The default value `AppearanceBased`, though not
         // manually set, is deprecated.
-        //
-        // `UnderWindowBackground` rather than `Selection`: on macOS 26+, `Selection` no longer
-        // vends the `CABackdropLayer` that `remove_layer_background` walks, so the view renders
-        // with no blur at all. `UnderWindowBackground` still vends one, and is the material
-        // AppKit documents for the area behind a window's own background.
+        // Selection does not expose the backdrop layer on macOS 26.
         NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::UnderWindowBackground);
-        // Behind-window blending is what samples the desktop rather than the window's own
-        // content. It is already the default, but this view exists only for that mode.
         NSVisualEffectView::setBlendingMode_(view, NSVisualEffectBlendingMode::BehindWindow);
         NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
         view
@@ -3451,16 +3445,11 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         let layer: id = msg_send![this, layer];
         if !layer.is_null() {
             remove_layer_background(layer);
-            // Fallback base BEHIND the backdrop sublayer. Mission Control and
-            // the Spaces switcher render window SNAPSHOTS, which omit backdrop
-            // layers entirely — with every background stripped above, the
-            // window read as fully transparent glass over the raw desktop
-            // there. An opaque dark root background is covered by the live
-            // blur in normal compositing, but keeps the snapshot reading as a
-            // solid dark surface (how stock vibrancy materials degrade).
-            let black: id = msg_send![class!(NSColor), blackColor];
-            let black_cg: id = msg_send![black, CGColor];
-            let _: () = msg_send![layer, setBackgroundColor: black_cg];
+            // Window snapshots omit backdrop layers, so retain an opaque base
+            // behind the live blur.
+            let black_color: id = msg_send![class!(NSColor), blackColor];
+            let black_cg_color: id = msg_send![black_color, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: black_cg_color];
         }
     }
 }
@@ -3478,19 +3467,17 @@ unsafe fn remove_layer_background(layer: id) {
 
         let filters: id = msg_send![layer, filters];
         if !filters.is_null() {
-            // Crank the backdrop blur: the material's default gaussian radius
-            // is tuned for thin translucency; the glass shell runs a heavy
-            // scrim over it, and a wider blur under that scrim reads calmer
-            // (user request — lower alpha, more blur).
-            let blur_test: id = ns_string("Blur");
+            // The default radius is too narrow under the window's dark scrim.
+            let blur_filter_name: id = ns_string("Blur");
             let count = NSArray::count(filters);
-            for i in 0..count {
-                let filter = filters.objectAtIndex(i);
+            for index in 0..count {
+                let filter = filters.objectAtIndex(index);
                 let description: id = msg_send![filter, description];
-                let hit: BOOL = msg_send![description, containsString: blur_test];
-                if hit == YES {
+                let contains_blur: BOOL = msg_send![description, containsString: blur_filter_name];
+                if contains_blur == YES {
                     let radius: id = msg_send![class!(NSNumber), numberWithDouble: 60.0f64];
-                    let _: () = msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
+                    let _: () =
+                        msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
                     let _: () = msg_send![layer, setFilters: filters];
                     break;
                 }
