@@ -1221,6 +1221,7 @@ impl WgpuRenderer {
             "fs_blur_pass",
             &layouts.globals,
             &layouts.backdrop,
+            None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(backdrop_target.clone())],
             1,
@@ -1232,6 +1233,7 @@ impl WgpuRenderer {
             "fs_backdrop_blur",
             &layouts.globals,
             &layouts.backdrop,
+            None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(backdrop_target)],
             1,
@@ -1942,7 +1944,7 @@ impl WgpuRenderer {
             );
         }
 
-        if let Err(error) = self.record_frame(scene, &frame_view) {
+        if let Err(error) = self.record_frame(scene, &frame_view, &frame.texture) {
             log::error!("{error:#}");
             self.resources().queue.submit(std::iter::empty());
             return false;
@@ -1952,7 +1954,12 @@ impl WgpuRenderer {
         true
     }
 
-    fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+    fn record_frame(
+        &mut self,
+        scene: &Scene,
+        frame_view: &wgpu::TextureView,
+        surface_texture: &wgpu::Texture,
+    ) -> Result<()> {
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -2006,7 +2013,7 @@ impl WgpuRenderer {
                     }
                     drop(pass);
                     let blurred =
-                        self.process_backdrop_blur(&mut encoder, &frame.texture, blur, blur_index);
+                        self.process_backdrop_blur(&mut encoder, surface_texture, blur, blur_index);
                     pass = Self::continue_main_pass(&mut encoder, frame_view);
                     if blurred {
                         self.draw_backdrop_composite(blur_index, &mut pass);
@@ -2768,6 +2775,26 @@ impl RenderingParameters {
     }
 }
 
+/// The draw order of a batch's first primitive — where the backdrop-blur
+/// interleave check anchors.
+fn batch_first_order(scene: &Scene, batch: &PrimitiveBatch) -> DrawOrder {
+    match batch {
+        PrimitiveBatch::Shadows(range) => scene.shadows[range.start].order,
+        PrimitiveBatch::Quads(range) => scene.quads[range.start].order,
+        PrimitiveBatch::Paths(range) => scene.paths[range.start].order,
+        PrimitiveBatch::Underlines(range) => scene.underlines[range.start].order,
+        PrimitiveBatch::MonochromeSprites { range, .. } => {
+            scene.monochrome_sprites[range.start].order
+        }
+        PrimitiveBatch::SubpixelSprites { range, .. } => scene.subpixel_sprites[range.start].order,
+        PrimitiveBatch::PolychromeSprites { range, .. } => {
+            scene.polychrome_sprites[range.start].order
+        }
+        PrimitiveBatch::Surfaces(range) => scene.surfaces[range.start].order,
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2809,21 +2836,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
-/// The draw order of a batch's first primitive — where the backdrop-blur
-/// interleave check anchors.
-fn batch_first_order(scene: &Scene, batch: &PrimitiveBatch) -> DrawOrder {
-    match batch {
-        PrimitiveBatch::Shadows(range) => scene.shadows[range.start].order,
-        PrimitiveBatch::Quads(range) => scene.quads[range.start].order,
-        PrimitiveBatch::Paths(range) => scene.paths[range.start].order,
-        PrimitiveBatch::Underlines(range) => scene.underlines[range.start].order,
-        PrimitiveBatch::MonochromeSprites { range, .. } => {
-            scene.monochrome_sprites[range.start].order
-        }
-        PrimitiveBatch::SubpixelSprites { range, .. } => scene.subpixel_sprites[range.start].order,
-        PrimitiveBatch::PolychromeSprites { range, .. } => {
-            scene.polychrome_sprites[range.start].order
-        }
-        PrimitiveBatch::Surfaces(range) => scene.surfaces[range.start].order,
     }
 }
+
