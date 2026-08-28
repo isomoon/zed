@@ -34,7 +34,6 @@ float blur_along_x(float x, float y, float sigma, float corner,
                    float2 half_size);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
-float edge_fade_alpha(float2 position, EdgeFadeParams fade);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
   float4 solid_color, float4 color0, float4 color1);
 
@@ -104,11 +103,6 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
-  // Per-pixel scoped edge fade — applied to the fill HERE so every return
-  // path (including the borderless fast paths) inherits it; the border
-  // fades at its own use below.
-  float edge_fade = edge_fade_alpha(input.position.xy, quad.fade);
-  background_color.a *= edge_fade;
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
     quad.corner_radii.bottom_left == 0.0 &&
@@ -217,7 +211,6 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   float4 color = background_color;
   if (border_sdf < antialias_threshold) {
     float4 border_color = input.border_color;
-    border_color.a *= edge_fade;
 
     // Dashed border logic when border_style == 1
     if (quad.border_style == 1) {
@@ -734,8 +727,7 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance) *
-             edge_fade_alpha(input.position.xy, sprite.fade);
+  color.a *= sprite.opacity * saturate(0.5 - distance);
   return color;
 }
 
@@ -1185,27 +1177,6 @@ float2x2 rotate2d(float angle) {
     return float2x2(c, -s, s, c);
 }
 
-// Scoped edge fade, PER PIXEL (Quad::fade / PolychromeSprite::fade): a
-// squared ramp from 0 at the fade edge to 1 a band further in, matching the
-// CPU-side per-glyph curve — all four edges. Zero band = edge disabled; a
-// zeroed struct is a no-op (returns 1).
-float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
-  float ramp = 1.0;
-  if (fade.band_top > 0.0) {
-    ramp = min(ramp, clamp((position.y - fade.top_y) / fade.band_top, 0.0, 1.0));
-  }
-  if (fade.band_bottom > 0.0) {
-    ramp = min(ramp, clamp((fade.bottom_y - position.y) / fade.band_bottom, 0.0, 1.0));
-  }
-  if (fade.band_left > 0.0) {
-    ramp = min(ramp, clamp((position.x - fade.left_x) / fade.band_left, 0.0, 1.0));
-  }
-  if (fade.band_right > 0.0) {
-    ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
-  }
-  return ramp * ramp;
-}
-
 float4 fill_color(Background background,
                       float2 position,
                       Bounds_ScaledPixels bounds,
@@ -1305,57 +1276,4 @@ float4 fill_color(Background background,
   }
 
   return color;
-}
-
-struct BackdropBlurVertexOutput {
-  float4 position [[position]];
-  uint blur_id [[flat]];
-  float clip_distance [[clip_distance]][4];
-};
-
-struct BackdropBlurFragmentInput {
-  float4 position [[position]];
-  uint blur_id [[flat]];
-};
-
-vertex BackdropBlurVertexOutput backdrop_blur_vertex(
-    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
-    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
-    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
-    constant Size_DevicePixels *viewport_size
-    [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
-  float2 unit_vertex = unit_vertices[unit_vertex_id];
-  BackdropBlur blur = blurs[blur_id];
-  float4 device_position =
-      to_device_position(unit_vertex, blur.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, blur.bounds,
-                                                 blur.content_mask.bounds);
-  return BackdropBlurVertexOutput{
-      device_position,
-      blur_id,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
-}
-
-fragment float4 backdrop_blur_fragment(
-    BackdropBlurFragmentInput input [[stage_in]],
-    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
-    constant float4 &source_rect [[buffer(BackdropBlurInputIndex_SourceRect)]],
-    texture2d<float> source_texture
-    [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
-  constexpr sampler source_sampler(coord::normalized, address::clamp_to_edge,
-                                   filter::linear);
-  BackdropBlur blur = blurs[input.blur_id];
-
-  // Rounded-rect clip: blending is disabled on this pipeline (the blur
-  // REPLACES the region), so fragments outside must discard, not return 0.
-  float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
-  if (distance > 0.) {
-    discard_fragment();
-  }
-
-  // The snapshot was gaussian-blurred on the GPU (MPSImageGaussianBlur)
-  // before this pass — one clean sample. The snapshot covers only
-  // source_rect (x, y, w, h) of the drawable, not the whole viewport.
-  float2 uv = (input.position.xy - source_rect.xy) / source_rect.zw;
-  return source_texture.sample(source_sampler, uv);
 }
