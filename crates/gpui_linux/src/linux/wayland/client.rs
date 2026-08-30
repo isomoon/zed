@@ -1,5 +1,5 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     hash::Hash,
     os::fd::{AsRawFd, BorrowedFd},
     path::PathBuf,
@@ -36,6 +36,9 @@ use wayland_client::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
         wl_shm_pool, wl_surface,
     },
+};
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1, ext_background_effect_surface_v1,
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
@@ -221,13 +224,30 @@ pub struct Globals {
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
-    pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
+    pub background_effect_manager:
+        Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
+    background_effect_blur_support: Rc<Cell<BackgroundEffectSupport>>,
+    pub kde_blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     pub system_bell: Option<xdg_system_bell_v1::XdgSystemBellV1>,
     pub executor: ForegroundExecutor,
     pub frame_ping: Ping,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BackgroundEffectSupport {
+    #[default]
+    Pending,
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BlurProtocol {
+    BackgroundEffect,
+    Kde,
 }
 
 impl Globals {
@@ -265,7 +285,9 @@ impl Globals {
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
-            blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            background_effect_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            background_effect_blur_support: Rc::new(Cell::new(BackgroundEffectSupport::Pending)),
+            kde_blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
@@ -274,6 +296,30 @@ impl Globals {
             qh,
             frame_ping,
         }
+    }
+
+    pub(super) fn blur_protocol(&self) -> Option<BlurProtocol> {
+        preferred_blur_protocol(
+            self.background_effect_manager.is_some(),
+            self.background_effect_blur_support.get(),
+            self.kde_blur_manager.is_some(),
+        )
+    }
+}
+
+fn preferred_blur_protocol(
+    has_background_effect_manager: bool,
+    background_effect_support: BackgroundEffectSupport,
+    has_kde_blur_manager: bool,
+) -> Option<BlurProtocol> {
+    if has_background_effect_manager
+        && background_effect_support != BackgroundEffectSupport::Unavailable
+    {
+        Some(BlurProtocol::BackgroundEffect)
+    } else if has_kde_blur_manager {
+        Some(BlurProtocol::Kde)
+    } else {
+        None
     }
 }
 
@@ -1433,8 +1479,52 @@ delegate_noop!(WaylandClientStatePtr: ignore xdg_positioner::XdgPositioner);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
 delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
+delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+
+impl Dispatch<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, ()>
+    for WaylandClientStatePtr
+{
+    fn event(
+        state: &mut Self,
+        _: &ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1,
+        event: ext_background_effect_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let ext_background_effect_manager_v1::Event::Capabilities { flags } = event else {
+            return;
+        };
+        let supports_blur = match flags {
+            WEnum::Value(capabilities) => {
+                capabilities.contains(ext_background_effect_manager_v1::Capability::Blur)
+            }
+            WEnum::Unknown(capabilities) => {
+                capabilities & ext_background_effect_manager_v1::Capability::Blur.bits() != 0
+            }
+        };
+        let support = if supports_blur {
+            BackgroundEffectSupport::Available
+        } else {
+            BackgroundEffectSupport::Unavailable
+        };
+
+        let client = state.get_client();
+        let windows = {
+            let client = client.borrow();
+            if client.globals.background_effect_blur_support.get() == support {
+                return;
+            }
+            client.globals.background_effect_blur_support.set(support);
+            client.windows.values().cloned().collect::<Vec<_>>()
+        };
+        for window in windows {
+            window.update_background_effect();
+        }
+    }
+}
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(
@@ -2903,6 +2993,38 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn prefers_background_effect_blur_when_available_or_pending() {
+        assert_eq!(
+            preferred_blur_protocol(true, BackgroundEffectSupport::Pending, true),
+            Some(BlurProtocol::BackgroundEffect)
+        );
+        assert_eq!(
+            preferred_blur_protocol(true, BackgroundEffectSupport::Available, true),
+            Some(BlurProtocol::BackgroundEffect)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_kde_blur_when_background_effect_blur_is_unavailable() {
+        assert_eq!(
+            preferred_blur_protocol(true, BackgroundEffectSupport::Unavailable, true),
+            Some(BlurProtocol::Kde)
+        );
+    }
+
+    #[test]
+    fn reports_no_blur_protocol_when_neither_protocol_supports_blur() {
+        assert_eq!(
+            preferred_blur_protocol(true, BackgroundEffectSupport::Unavailable, false),
+            None
+        );
+        assert_eq!(
+            preferred_blur_protocol(false, BackgroundEffectSupport::Pending, false),
+            None
+        );
+    }
 
     #[derive(Default)]
     struct FakeImeCursorRectangleSink {

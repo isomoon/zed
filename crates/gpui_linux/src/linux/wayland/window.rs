@@ -15,8 +15,9 @@ use wayland_backend::client::ObjectId;
 use wayland_client::WEnum;
 use wayland_client::{
     Proxy,
-    protocol::{wl_callback, wl_output, wl_seat, wl_surface},
+    protocol::{wl_callback, wl_output, wl_region, wl_seat, wl_surface},
 };
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_popup;
@@ -43,6 +44,8 @@ use gpui::{
     px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+
+use super::client::BlurProtocol;
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -103,7 +106,7 @@ pub struct WaylandWindowState {
     pub surface: wl_surface::WlSurface,
     app_id: Option<String>,
     appearance: WindowAppearance,
-    blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    blur: Option<WaylandBlur>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -131,6 +134,39 @@ pub struct WaylandWindowState {
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+}
+
+enum WaylandBlur {
+    BackgroundEffect(ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1),
+    Kde(org_kde_kwin_blur::OrgKdeKwinBlur),
+}
+
+impl WaylandBlur {
+    fn protocol(&self) -> BlurProtocol {
+        match self {
+            Self::BackgroundEffect(_) => BlurProtocol::BackgroundEffect,
+            Self::Kde(_) => BlurProtocol::Kde,
+        }
+    }
+
+    fn destroy(self) {
+        match self {
+            Self::BackgroundEffect(effect) => effect.destroy(),
+            Self::Kde(blur) => blur.release(),
+        }
+    }
+
+    fn unset(self, surface: &wl_surface::WlSurface, globals: &Globals) {
+        match self {
+            Self::BackgroundEffect(effect) => effect.destroy(),
+            Self::Kde(blur) => {
+                if let Some(manager) = globals.kde_blur_manager.as_ref() {
+                    manager.unset(surface);
+                }
+                blur.release();
+            }
+        }
+    }
 }
 
 pub enum WaylandSurfaceState {
@@ -764,9 +800,9 @@ impl Drop for WaylandWindow {
 
         state.renderer.destroy();
 
-        // Destroy blur first, this has no dependencies.
-        if let Some(blur) = &state.blur {
-            blur.release();
+        // Release the effect before destroying its wl_surface.
+        if let Some(blur) = state.blur.take() {
+            blur.destroy();
         }
 
         // Decorations must be destroyed before the xdg state.
@@ -1028,6 +1064,11 @@ impl WaylandWindowStatePtr {
     fn request_redraw(&self) {
         self.state.borrow_mut().redraw_requested = true;
         self.schedule_frame();
+    }
+
+    pub(super) fn update_background_effect(&self) {
+        update_window(self.state.borrow_mut());
+        self.request_redraw();
     }
 
     fn update_ime_enabled(&self) {
@@ -1449,11 +1490,11 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
-        let (size, scale) = {
+        let (size, scale, size_changed) = {
             let mut state = self.state.borrow_mut();
-            if size.is_none_or(|size| size == state.bounds.size)
-                && scale.is_none_or(|scale| scale == state.scale)
-            {
+            let size_changed = size.is_some_and(|size| size != state.bounds.size);
+            let scale_changed = scale.is_some_and(|scale| scale != state.scale);
+            if !size_changed && !scale_changed {
                 return;
             }
             if let Some(size) = size {
@@ -1464,8 +1505,12 @@ impl WaylandWindowStatePtr {
             }
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             state.renderer.update_drawable_size(device_bounds.size);
-            (state.bounds.size, state.scale)
+            (state.bounds.size, state.scale, size_changed)
         };
+
+        if size_changed {
+            update_window(self.state.borrow_mut());
+        }
 
         let callback = self.callbacks.borrow_mut().resize.take();
         if let Some(mut fun) = callback {
@@ -2172,8 +2217,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
     state.renderer.update_transparency(!opaque);
-    let opaque_area = state.window_bounds.map(|v| f32::from(v) as i32);
-    opaque_area.inset(f32::from(state.inset()) as i32);
+    let opaque_area = surface_effect_area(state.bounds, state.inset());
 
     let region = state
         .globals
@@ -2199,23 +2243,88 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
-    if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
-            if state.blur.is_none() {
-                let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
-                state.blur = Some(blur);
-            }
-            state.blur.as_ref().unwrap().commit();
-        } else {
-            // It probably doesn't hurt to clear the blur for opaque windows
-            blur_manager.unset(&state.surface);
-            if let Some(b) = state.blur.take() {
-                b.release()
-            }
-        }
-    }
+    update_blur(&mut state, &region);
 
     region.destroy();
+}
+
+fn surface_effect_area(bounds: Bounds<Pixels>, inset: Pixels) -> Bounds<i32> {
+    bounds
+        .map_origin(|_| px(0.0))
+        .map(|value| f32::from(value) as i32)
+        .inset(f32::from(inset) as i32)
+}
+
+#[cfg(test)]
+mod surface_effect_area_tests {
+    use super::*;
+
+    #[test]
+    fn uses_current_size_in_surface_local_coordinates() {
+        let bounds = Bounds {
+            origin: Point {
+                x: px(300.0),
+                y: px(200.0),
+            },
+            size: size(px(1280.0), px(720.0)),
+        };
+
+        assert_eq!(
+            surface_effect_area(bounds, px(8.0)),
+            Bounds {
+                origin: Point { x: 8, y: 8 },
+                size: Size {
+                    width: 1264,
+                    height: 704,
+                },
+            }
+        );
+    }
+}
+
+fn update_blur(state: &mut WaylandWindowState, region: &wl_region::WlRegion) {
+    let requested_protocol = if state.background_appearance == WindowBackgroundAppearance::Blurred {
+        state.globals.blur_protocol()
+    } else {
+        None
+    };
+    let active_protocol = state.blur.as_ref().map(WaylandBlur::protocol);
+
+    if active_protocol != requested_protocol {
+        if let Some(blur) = state.blur.take() {
+            blur.unset(&state.surface, &state.globals);
+        }
+        state.blur = requested_protocol.and_then(|protocol| create_blur(state, protocol));
+    }
+
+    match state.blur.as_ref() {
+        Some(WaylandBlur::BackgroundEffect(effect)) => effect.set_blur_region(Some(region)),
+        Some(WaylandBlur::Kde(blur)) => blur.commit(),
+        None => {}
+    }
+}
+
+fn create_blur(state: &WaylandWindowState, protocol: BlurProtocol) -> Option<WaylandBlur> {
+    match protocol {
+        BlurProtocol::BackgroundEffect => {
+            state
+                .globals
+                .background_effect_manager
+                .as_ref()
+                .map(|manager| {
+                    WaylandBlur::BackgroundEffect(manager.get_background_effect(
+                        &state.surface,
+                        &state.globals.qh,
+                        (),
+                    ))
+                })
+        }
+        BlurProtocol::Kde => {
+            state.globals.kde_blur_manager.as_ref().map(|manager| {
+                WaylandBlur::Kde(manager.create(&state.surface, &state.globals.qh, ()))
+            })
+        }
+    }
 }
 
 pub(crate) trait WindowDecorationsExt {
